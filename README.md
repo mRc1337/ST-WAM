@@ -17,7 +17,7 @@ complementary components:
   conditions only the action expert.
 
 The repository includes the full LIBERO and RoboTwin training/evaluation paths,
-the paper ablations, latent-cache tools, and persistent multi-GPU evaluators.
+selected paper ablations, latent-cache tools, and persistent multi-GPU evaluators.
 
 ## Installation
 
@@ -153,7 +153,6 @@ python experiments/robotwin/run_robotwin_manager.py \
 | DINO Future Only | `fastwam_dino_s_smallvideo` |
 | Dual-Space w/o CAIR | `fastwam_wan5b_dino_s_aux_mot` |
 | w/o Semantic Future Expert | `fastwam_qwen3vl_dino_history` |
-| Semantic Expert w/o Future Obj. | `fastwam_wan5b_dino_s_aux_mot_condition_only` |
 | Naive History Retrieval | `fastwam_wan5b_dino_s_aux_mot_short_intent_hist4` |
 | Qwen Current Only | `fastwam_wan5b_dino_s_aux_mot_short_qwen3vl_current` |
 | CAIR with VAE History | `fastwam_wan5b_dino_s_aux_mot_short_qwen3vl_vae_hist4` |

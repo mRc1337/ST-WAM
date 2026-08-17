@@ -76,20 +76,6 @@ def main() -> None:
         "2-MoT readout task must load the current semantic image.",
     )
 
-    condition_model = load_yaml(root, "configs/model/fastwam_wan5b_dino_s_aux_mot_condition_only.yaml")
-    condition_task = load_yaml(
-        root, "configs/task/libero_wan5b_dino_s_aux_mot_condition_only_2cam_224_1e-4.yaml"
-    )
-    require(condition_model["dino_future_mode"] == "condition_only", "Condition-only mode is not selected.")
-    require(
-        float(condition_model["loss"]["lambda_dino"]) == 0.0,
-        "Condition-only configuration must not weight a DINO future loss.",
-    )
-    require(
-        condition_task["defaults"][1]["override /model"] == "fastwam_wan5b_dino_s_aux_mot_condition_only",
-        "Condition-only task must select the condition-only model.",
-    )
-
     mot_source = (root / "src/fastwam/models/wan22/fastwam_vae_dino_mot.py").read_text(encoding="utf-8")
     semantic_source = (root / "src/fastwam/models/wan22/semantic_history.py").read_text(encoding="utf-8")
     two_mot_source = (root / "src/fastwam/models/wan22/fastwam_semantic_history.py").read_text(
@@ -109,9 +95,6 @@ def main() -> None:
         (libero_eval_source, "eval_libero_single.py"),
     ):
         ast.parse(source, filename=path)
-    require("dino_future_mode" in mot_source, "3-MoT implementation lacks the future-mode switch.")
-    require("inputs[\"first_frame_dino_latents\"]" in mot_source, "Condition-only path must use DINO f0.")
-    require("timestep_dino = torch.zeros_like(timestep_video)" in mot_source, "DINO f0 must use t=0.")
     require("if not self.use_history" in semantic_source, "Semantic adapter lacks the no-history path.")
     require("history_source" in semantic_source, "Semantic adapter lacks the history-source switch.")
     require("self.semantic_history_source == \"vae\"" in mot_source, "3-MoT lacks VAE semantic-history routing.")
