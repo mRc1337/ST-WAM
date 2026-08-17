@@ -25,6 +25,35 @@ def main() -> None:
     args = parser.parse_args()
     root = args.root.resolve()
 
+    dino_only_model = load_yaml(root, "configs/model/fastwam_dino_s_smallvideo.yaml")
+    dino_only_task = load_yaml(root, "configs/task/libero_dino_s_smallvideo_2cam_224_1e-4.yaml")
+    require(
+        dino_only_model["_target_"] == "fastwam.runtime.create_fastwam_dino",
+        "DINO Future Only must instantiate the DINO/action two-expert model.",
+    )
+    require("intent_config" not in dino_only_model, "DINO Future Only must not use history.")
+    require(
+        dino_only_task["defaults"][1]["override /model"] == "fastwam_dino_s_smallvideo",
+        "DINO Future Only task selects the wrong model.",
+    )
+
+    dual_model = load_yaml(root, "configs/model/fastwam_wan5b_dino_s_aux_mot.yaml")
+    dual_task = load_yaml(root, "configs/task/libero_wan5b_dino_s_aux_mot_2cam_224_1e-4.yaml")
+    require(
+        dual_model["_target_"] == "fastwam.runtime.create_fastwam_vae_dino_mot",
+        "Dual-Space w/o CAIR must instantiate the three-expert model.",
+    )
+    require(float(dual_model["loss"]["lambda_dino"]) > 0.0, "Dual-Space needs DINO future loss.")
+    require("intent_config" not in dual_model, "Dual-Space w/o CAIR must not use legacy history.")
+    require(
+        "semantic_history_config" not in dual_model,
+        "Dual-Space w/o CAIR must not instantiate CAIR.",
+    )
+    require(
+        dual_task["defaults"][1]["override /model"] == "fastwam_wan5b_dino_s_aux_mot",
+        "Dual-Space w/o CAIR task selects the wrong model.",
+    )
+
     qwen_current_model = load_yaml(
         root, "configs/model/fastwam_wan5b_dino_s_aux_mot_short_qwen3vl_current.yaml"
     )
@@ -74,6 +103,25 @@ def main() -> None:
     require(
         qwen_2mot_task["data"]["train"]["load_semantic_image"],
         "2-MoT readout task must load the current semantic image.",
+    )
+
+    main_model = load_yaml(
+        root, "configs/model/fastwam_wan5b_dino_s_aux_mot_short_qwen3vl_hist4.yaml"
+    )
+    main_task = load_yaml(
+        root,
+        "configs/task/libero_wan5b_dino_s_aux_mot_short_qwen3vl_hist4_vae_mmap_2cam_224_1e-4.yaml",
+    )
+    main_semantic = main_model["semantic_history_config"]
+    main_data = main_task["data"]["train"]
+    require(main_semantic["enabled"], "ST-WAM must enable CAIR.")
+    require(main_semantic.get("source", "dino") == "dino", "ST-WAM must use DINO history.")
+    require(main_semantic.get("use_history", True), "ST-WAM must retain short-horizon history.")
+    require(main_data["load_semantic_image"], "ST-WAM must load the current Qwen image.")
+    require(main_data["load_history_dino_latents"], "ST-WAM must load DINO history.")
+    require(
+        main_semantic["history_offsets"] == main_data["history_dino_frame_offsets"],
+        "ST-WAM train/infer history offsets must match.",
     )
 
     mot_source = (root / "src/fastwam/models/wan22/fastwam_vae_dino_mot.py").read_text(encoding="utf-8")
