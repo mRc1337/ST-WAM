@@ -17,7 +17,7 @@ import contextlib
 import logging
 import shutil
 from pathlib import Path
-from typing import Callable, List, Literal
+from typing import Callable, Iterable, List, Literal
 import warnings
 
 import datasets
@@ -26,6 +26,7 @@ import packaging.version
 import PIL.Image
 import torch
 import torch.utils
+import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import concatenate_datasets, load_dataset
 from huggingface_hub import HfApi, snapshot_download
@@ -111,10 +112,17 @@ class LeRobotDatasetMetadata:
         self.tasks, self.task_to_task_index = load_tasks(self.root)
         if (self.root / "annotations").exists():
             self.annotations = load_annotations(self.root)
-        self.episodes = load_episodes(self.root)
+        self.episodes = load_episodes(self.root, video_keys=self.video_keys)
         if self._version < packaging.version.parse("v2.1"):
             self.stats = load_stats(self.root)
             self.episodes_stats = backward_compatible_episodes_stats(self.stats, self.episodes)
+        elif self._version >= packaging.version.parse("v3.0"):
+            # LeRobot v3 keeps the aggregate statistics in meta/stats.json and
+            # embeds per-episode statistics in packed episode parquet files.
+            # Training here uses the aggregate statistics; loading every
+            # per-episode stat column would add substantial startup memory.
+            self.stats = load_stats(self.root)
+            self.episodes_stats = {}
         else:
             self.episodes_stats = load_episodes_stats(self.root)
             self.stats = aggregate_stats(list(self.episodes_stats.values()))
@@ -139,14 +147,36 @@ class LeRobotDatasetMetadata:
         return packaging.version.parse(self.info["codebase_version"])
 
     def get_data_file_path(self, ep_index: int) -> Path:
+        if self._version >= packaging.version.parse("v3.0"):
+            episode = self.episodes[int(ep_index)]
+            fpath = self.data_path.format(
+                chunk_index=int(episode["data/chunk_index"]),
+                file_index=int(episode["data/file_index"]),
+            )
+            return Path(fpath)
         ep_chunk = self.get_episode_chunk(ep_index)
         fpath = self.data_path.format(episode_chunk=ep_chunk, episode_index=ep_index)
         return Path(fpath)
 
     def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
+        if self._version >= packaging.version.parse("v3.0"):
+            episode = self.episodes[int(ep_index)]
+            prefix = f"videos/{vid_key}"
+            fpath = self.video_path.format(
+                video_key=vid_key,
+                chunk_index=int(episode[f"{prefix}/chunk_index"]),
+                file_index=int(episode[f"{prefix}/file_index"]),
+            )
+            return Path(fpath)
         ep_chunk = self.get_episode_chunk(ep_index)
         fpath = self.video_path.format(episode_chunk=ep_chunk, video_key=vid_key, episode_index=ep_index)
         return Path(fpath)
+
+    def get_video_timestamp_offset(self, ep_index: int, vid_key: str) -> float:
+        if self._version < packaging.version.parse("v3.0"):
+            return 0.0
+        episode = self.episodes[int(ep_index)]
+        return float(episode[f"videos/{vid_key}/from_timestamp"])
 
     def get_episode_chunk(self, ep_index: int) -> int:
         return ep_index // self.chunks_size
@@ -481,9 +511,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
         )
-        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
+        if (
+            self.episodes is not None
+            and packaging.version.parse("v2.1") <= self.meta._version < packaging.version.parse("v3.0")
+        ):
             episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
             self.stats = aggregate_stats(episodes_stats)
+        else:
+            self.stats = self.meta.stats
 
         # Load actual data
         try:
@@ -597,20 +632,71 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def get_episodes_file_paths(self) -> list[Path]:
         episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
-        fpaths = [str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
+        # LeRobot v3 packs multiple episodes into the same parquet/video file.
+        # Preserve order while de-duplicating paths so cache checks and remote
+        # downloads operate on the actual packed files.
+        fpaths = list(dict.fromkeys(str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes))
         if len(self.meta.video_keys) > 0:
-            video_files = [
-                str(self.meta.get_video_file_path(ep_idx, vid_key))
-                for vid_key in self.meta.video_keys
-                for ep_idx in episodes
-            ]
+            video_files = list(
+                dict.fromkeys(
+                    str(self.meta.get_video_file_path(ep_idx, vid_key))
+                    for vid_key in self.meta.video_keys
+                    for ep_idx in episodes
+                )
+            )
             fpaths += video_files
 
         return fpaths
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
-        if self.episodes is None:
+        if self.meta._version >= packaging.version.parse("v3.0"):
+            # Packed v3 files must be loaded in chunk/file order so their row
+            # order remains aligned with the global dataset indices recorded
+            # in episode metadata.
+            files = sorted(self.root.glob("data/chunk-*/file-*.parquet"))
+            if not files:
+                raise FileNotFoundError(f"No LeRobot v3 parquet files found under {self.root / 'data'}")
+            # datasets==3.x cannot parse the newer Hugging Face feature
+            # metadata (notably feature type "List") written by LeRobot v3.
+            # Read the Arrow payload directly and discard only the incompatible
+            # schema metadata. Restrict columns to model inputs to avoid loading
+            # large raw simulator-state/debug columns that FastWAM never uses.
+            required_columns = {
+                "timestamp",
+                "frame_index",
+                "episode_index",
+                "index",
+                "task_index",
+            }
+            if self.delta_timestamps is not None:
+                required_columns.update(
+                    key for key in self.delta_timestamps if key not in self.meta.video_keys
+                )
+            else:
+                required_columns.update(
+                    key for key in self.meta.features if key not in self.meta.video_keys
+                )
+            ordered_columns = [
+                key for key in self.meta.features if key in required_columns
+            ]
+            tables = [pq.read_table(path, columns=ordered_columns) for path in files]
+            table = pa.concat_tables(tables).replace_schema_metadata(None)
+            hf_dataset = datasets.Dataset(table)
+            selected_episodes = (
+                list(range(self.meta.total_episodes)) if self.episodes is None else list(self.episodes)
+            )
+            if selected_episodes != list(range(self.meta.total_episodes)):
+                selected_indices = [
+                    frame_idx
+                    for ep_idx in selected_episodes
+                    for frame_idx in range(
+                        int(self.meta.episodes[ep_idx]["dataset_from_index"]),
+                        int(self.meta.episodes[ep_idx]["dataset_to_index"]),
+                    )
+                ]
+                hf_dataset = hf_dataset.select(selected_indices)
+        elif self.episodes is None:
             path = str(self.root / "data")
             hf_dataset = load_dataset("parquet", data_dir=path, split="train")
         else:
@@ -713,13 +799,30 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return result
     
     # no videos
-    def get_episode_data(self, episode_id: int) -> dict:
+    def get_episode_data(
+        self,
+        episode_id: int,
+        feature_keys: Iterable[str] | None = None,
+    ) -> dict:
         ep_start = self.episode_data_index["from"][episode_id].item()
         ep_end = self.episode_data_index["to"][episode_id].item()
         q_idx = list(range(ep_start, ep_end))
         # selected_data = self.hf_dataset.select(q_idx)
         selected_data = self.hf_dataset[q_idx]
-        res_keys = self.meta.features.keys() - set(self.meta.video_keys)
+        if feature_keys is None:
+            # Preserve the legacy behavior for callers that expect every
+            # non-video feature described by the dataset metadata.
+            res_keys = list(self.meta.features.keys() - set(self.meta.video_keys))
+        else:
+            res_keys = list(dict.fromkeys(feature_keys))
+
+        available_keys = set(self.hf_dataset.column_names)
+        missing_keys = [key for key in res_keys if key not in available_keys]
+        if missing_keys:
+            raise KeyError(
+                "Episode data requested columns that are not loaded: "
+                f"{missing_keys}. Loaded columns: {sorted(available_keys)}"
+            )
         res = {key : torch.stack(selected_data[key]) for key in res_keys}
         return res
 
@@ -732,7 +835,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         item = {}
         for vid_key, query_ts in query_timestamps.items():
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, query_ts, self.tolerance_s, self.video_backend)
+            offset = self.meta.get_video_timestamp_offset(ep_idx, vid_key)
+            packed_query_ts = [float(timestamp) + offset for timestamp in query_ts]
+            frames = decode_video_frames(
+                video_path, packed_query_ts, self.tolerance_s, self.video_backend
+            )
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -1125,9 +1232,9 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         # restriction in future iterations of this class. For now, this is necessary at least for being able
         # to use PyTorch's default DataLoader collate function.
         self.disabled_features = set()
-        intersection_features = set(self._datasets[0].features)
+        intersection_features = set(self._datasets[0].hf_features)
         for ds in self._datasets:
-            intersection_features.intersection_update(ds.features)
+            intersection_features.intersection_update(ds.hf_features)
         if len(intersection_features) == 0:
             raise RuntimeError(
                 "Multiple datasets were provided but they had no keys common to all of them. "
@@ -1135,7 +1242,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
             )
         for ds_name, ds in zip(self.ds_names, self._datasets, strict=True):
             # Disable warning of empty extra keys do
-            extra_keys = set(ds.features).difference(intersection_features)
+            extra_keys = set(ds.hf_features).difference(intersection_features)
             if extra_keys:
                 logging.warning(
                     f"keys {extra_keys} of {ds_name} were disabled as they are not contained in all the "
@@ -1148,7 +1255,22 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         # TODO(rcadene, aliberts): We should not perform this aggregation for datasets
         # with multiple robots of different ranges. Instead we should have one normalization
         # per robot.
-        self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
+        # Aggregate only modalities requested by this dataset instance. LeRobot
+        # v3 metadata may include raw simulator/debug features whose shapes vary
+        # between suites (for example source.raw.states in LIBERO-100), even
+        # though those columns are not loaded or consumed by FastWAM.
+        requested_stat_keys = (
+            set(self.delta_timestamps) if self.delta_timestamps is not None else intersection_features
+        )
+        stats_to_aggregate = [
+            {
+                key: value
+                for key, value in dataset.meta.stats.items()
+                if key in requested_stat_keys
+            }
+            for dataset in self._datasets
+        ]
+        self.stats = aggregate_stats(stats_to_aggregate)
 
     def set_during_training(self, during_training: bool):
         for dataset in self._datasets:
@@ -1234,32 +1356,17 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         # 1e-4 to account for possible numerical error
         return 1 / self.fps - 1e-4
     
-    def get_episode_data(self, episode_idx: int) -> dict:
+    def get_episode_data(
+        self,
+        episode_idx: int,
+        feature_keys: Iterable[str] | None = None,
+    ) -> dict:
         for dataset in self._datasets:
             if episode_idx < dataset.num_episodes:
-                file = str(dataset.root / dataset.meta.get_data_file_path(dataset.episodes[episode_idx]))
-                table = pq.read_table(str(file))
-
-                result_dict = {}
-                for col_name in table.column_names:
-                    col = table[col_name]
-                    try:
-                        np_arr = col.to_numpy(zero_copy_only=True)
-                    except Exception:
-                        raw = col.to_numpy()
-                        np_arr = np.stack(raw) if raw.dtype == object else raw
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings(
-                            "ignore",
-                            message="The given NumPy array is not writable",
-                            category=UserWarning,
-                        )
-                        # deal with string in parquet file
-                        if np_arr.dtype == 'O':                        
-                            result_dict[col_name] = np_arr
-                        else:
-                            result_dict[col_name] = torch.from_numpy(np_arr)
-                return result_dict
+                return dataset.get_episode_data(
+                    episode_idx,
+                    feature_keys=feature_keys,
+                )
             else:
                 episode_idx -= dataset.num_episodes
         raise IndexError(f"Episode index {episode_idx} out of bounds.")

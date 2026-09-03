@@ -36,6 +36,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # optional episode subset filtering
         episode_filter: Optional[str] = None,
+        task_indices: Optional[List[int]] = None,
         robotwin_split_block_size: int = 550,
         robotwin_clean_episodes_per_block: int = 50,
     ):
@@ -92,12 +93,17 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
         self.episode_filter = self._normalize_episode_filter(episode_filter)
+        self.task_indices = (
+            None if task_indices is None else frozenset(int(task_index) for task_index in task_indices)
+        )
+        if self.task_indices is not None and len(self.task_indices) == 0:
+            raise ValueError("`task_indices` must not be empty when provided.")
         self.robotwin_split_block_size = int(robotwin_split_block_size)
         self.robotwin_clean_episodes_per_block = int(robotwin_clean_episodes_per_block)
 
         episodes = {}
         for meta in metas:
-            episode_indices = self._build_episode_indices(meta.total_episodes)
+            episode_indices = self._build_episode_indices(meta)
             total_filtered_episodes = len(episode_indices)
             if val_set_proportion >= 1e-6:
                 split_idx = int(total_filtered_episodes * (1 - val_set_proportion))
@@ -158,12 +164,32 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             )
         return episode_filter
 
-    def _build_episode_indices(self, total_episodes: int) -> List[int]:
+    def _build_episode_indices(self, meta) -> List[int]:
         if self.episode_filter is None:
-            return list(range(total_episodes))
-        if self.episode_filter == "robotwin_clean":
-            return self._build_robotwin_clean_episode_indices(total_episodes)
-        raise AssertionError(f"Unhandled episode_filter={self.episode_filter!r}")
+            episode_indices = list(range(meta.total_episodes))
+        elif self.episode_filter == "robotwin_clean":
+            episode_indices = self._build_robotwin_clean_episode_indices(meta.total_episodes)
+        else:
+            raise AssertionError(f"Unhandled episode_filter={self.episode_filter!r}")
+
+        if self.task_indices is None:
+            return episode_indices
+
+        selected = []
+        for episode_index in episode_indices:
+            episode_tasks = meta.episodes[episode_index].get("tasks", [])
+            episode_task_indices = set()
+            for task in episode_tasks:
+                task_index = meta.get_task_index(task)
+                if task_index is not None:
+                    episode_task_indices.add(task_index)
+            if episode_task_indices.intersection(self.task_indices):
+                selected.append(episode_index)
+        if not selected:
+            raise ValueError(
+                f"No episodes in {meta.repo_id} matched task_indices={sorted(self.task_indices)}."
+            )
+        return selected
 
     def _build_robotwin_clean_episode_indices(self, total_episodes: int) -> List[int]:
         block_size = self.robotwin_split_block_size
@@ -216,7 +242,19 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         return lerobot_sample
     
     def _get_episode_data(self, episode_idx):
-        lerobot_sample = self.multi_dataset.get_episode_data(episode_idx)
+        # Statistics only need the state/action modalities declared by the
+        # active model config.  In particular, LeRobot v3 metadata may list
+        # simulator/debug columns that were intentionally not loaded.
+        feature_keys = list(
+            dict.fromkeys(
+                meta["lerobot_key"]
+                for meta in (*self.state_meta, *self.action_meta)
+            )
+        )
+        lerobot_sample = self.multi_dataset.get_episode_data(
+            episode_idx,
+            feature_keys=feature_keys,
+        )
         lerobot_sample = self._split_lerobot_sample(lerobot_sample)
         state, action = {}, {}
         for meta in self.state_meta:

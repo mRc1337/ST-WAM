@@ -39,6 +39,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         is_training_set=False,
         global_sample_stride=1,
         episode_filter: Optional[str] = None,
+        task_indices: Optional[list[int]] = None,
         robotwin_split_block_size: int = 550,
         robotwin_clean_episodes_per_block: int = 50,
         action_video_freq_ratio: int = 1,
@@ -73,6 +74,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
             episode_filter=episode_filter,
+            task_indices=task_indices,
             robotwin_split_block_size=robotwin_split_block_size,
             robotwin_clean_episodes_per_block=robotwin_clean_episodes_per_block,
         )
@@ -210,7 +212,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
     def _assert_episode_filter_cache_safe(self) -> None:
         episode_filter = getattr(self.lerobot_dataset, "episode_filter", None)
-        if episode_filter is None or self.allow_latent_cache_with_episode_filter:
+        task_indices = getattr(self.lerobot_dataset, "task_indices", None)
+        if (
+            episode_filter is None
+            and task_indices is None
+        ) or self.allow_latent_cache_with_episode_filter:
             return
         active_cache_dirs = []
         if self.dino_latent_cache_dir is not None and str(self.dino_latent_cache_dir).strip() != "":
@@ -220,7 +226,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if not active_cache_dirs:
             return
         raise ValueError(
-            f"`episode_filter={episode_filter}` reindexes dataset frame ids, so full-dataset "
+            f"`episode_filter={episode_filter}` / `task_indices={task_indices}` reindexes dataset "
+            "frame ids, so full-dataset "
             f"latent caches can become misaligned: {active_cache_dirs}. Use online encoding, "
             "or regenerate caches for the same filtered dataset and set "
             "`allow_latent_cache_with_episode_filter=true` explicitly."

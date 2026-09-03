@@ -7,6 +7,9 @@
 Official implementation of **ST-WAM: Semantic-Temporal World Action Model for
 Robust Manipulation under Visual Distribution Shifts**.
 
+For the three-variant LIBERO-Plus reproduction protocol, see
+[`docs/LIBERO_PLUS_ABLATION_REPRODUCTION.md`](docs/LIBERO_PLUS_ABLATION_REPRODUCTION.md).
+
 ST-WAM extends [FastWAM](https://github.com/yuantianyuan01/FastWAM) with two
 complementary components:
 
@@ -59,11 +62,11 @@ Generate the two DiT initializations with:
 
 ```bash
 python scripts/preprocess_action_dit_backbone.py \
-  --model-config configs/model/fastwam_wan5b_dino_s_aux_mot_short_qwen3vl_hist4.yaml \
+  --model-config configs/model/fastwam.yaml \
   --output checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 
 python scripts/preprocess_dino_video_dit_backbone.py \
-  --model-config configs/model/fastwam_wan5b_dino_s_aux_mot_short_qwen3vl_hist4.yaml \
+  --model-config configs/model/fastwam_dino_s_smallvideo.yaml \
   --output checkpoints/DinoVideoDiT_smallvideo_from_Wan22_alphascale_1024hdim.pt
 ```
 
@@ -81,15 +84,24 @@ the resulting feature cache are substantially larger. A precomputed
 [RoboTwin DINO cache](https://modelscope.cn/datasets/THU4Spiderman/Robotwin-dino-cache)
 is nevertheless provided as an optional download.
 
+For a local LeRobot v3 LIBERO export, set `LIBERO_DATA_ROOT` and select the v3
+data config. It reads packed v3 parquet/video files directly and selects task
+indices 0-9 from `libero_100` as LIBERO-Long:
+
+```bash
+export LIBERO_DATA_ROOT=/mnt/data/embodied_datasets/public_datasets_staging/lerobot_v3_0/libero
+python scripts/check_libero_v3_dataset.py
+```
+
 ```bash
 TASK=libero_wan5b_dino_s_aux_mot_short_qwen3vl_hist4_vae_mmap_2cam_224_1e-4
 
 torchrun --standalone --nproc_per_node=8 \
-  scripts/precompute_text_embeds.py task=${TASK}
+  scripts/precompute_text_embeds.py task=${TASK} data=libero_2cam_v3
 torchrun --standalone --nproc_per_node=8 \
-  scripts/precompute_vae_latents.py task=${TASK}
+  scripts/precompute_vae_latents.py task=${TASK} data=libero_2cam_v3
 torchrun --standalone --nproc_per_node=8 \
-  scripts/precompute_dino_latents.py task=${TASK}
+  scripts/precompute_dino_latents.py task=${TASK} data=libero_2cam_v3
 ```
 
 Cache directories and cache modes are defined in the selected task YAML. Use

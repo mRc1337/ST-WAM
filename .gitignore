@@ -180,6 +180,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.runtime/
 env/
 venv/
 ENV/

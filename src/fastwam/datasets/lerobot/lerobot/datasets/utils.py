@@ -30,6 +30,7 @@ import datasets
 import jsonlines
 import numpy as np
 import packaging.version
+import pyarrow.parquet as pq
 import torch
 from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
@@ -55,6 +56,8 @@ EPISODES_PATH = "meta/episodes.jsonl"
 STATS_PATH = "meta/stats.json"
 EPISODES_STATS_PATH = "meta/episodes_stats.jsonl"
 TASKS_PATH = "meta/tasks.jsonl"
+V3_TASKS_PATH = "meta/tasks.parquet"
+V3_EPISODES_GLOB = "meta/episodes/chunk-*/file-*.parquet"
 
 ANNOTATION_PATHS = {
     "subtask": "annotations/subtask_annotations.jsonl",
@@ -226,8 +229,43 @@ def write_task(task_index: int, task: dict, local_dir: Path):
 
 
 def load_tasks(local_dir: Path) -> tuple[dict, dict]:
-    tasks = load_jsonlines(local_dir / TASKS_PATH)
-    tasks = {item["task_index"]: item["task"] for item in sorted(tasks, key=lambda x: x["task_index"])}
+    jsonl_path = local_dir / TASKS_PATH
+    if jsonl_path.exists():
+        task_rows = load_jsonlines(jsonl_path)
+    else:
+        parquet_path = local_dir / V3_TASKS_PATH
+        if not parquet_path.exists():
+            raise FileNotFoundError(
+                f"Neither legacy task metadata {jsonl_path} nor LeRobot v3 metadata "
+                f"{parquet_path} exists."
+            )
+        table = pq.read_table(parquet_path)
+        if "task_index" not in table.column_names:
+            raise ValueError(f"Missing task_index in {parquet_path}: {table.column_names}")
+        if "task" in table.column_names:
+            task_column = "task"
+        elif "__index_level_0__" in table.column_names:
+            # Pandas-backed LeRobot v3 exports store the task string as the
+            # dataframe index under this column name.
+            task_column = "__index_level_0__"
+        else:
+            candidates = [name for name in table.column_names if name != "task_index"]
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"Cannot identify task text column in {parquet_path}: {table.column_names}"
+                )
+            task_column = candidates[0]
+        task_rows = [
+            {"task_index": int(task_index), "task": str(task)}
+            for task_index, task in zip(
+                table["task_index"].to_pylist(), table[task_column].to_pylist(), strict=True
+            )
+        ]
+
+    tasks = {
+        item["task_index"]: item["task"]
+        for item in sorted(task_rows, key=lambda x: x["task_index"])
+    }
     task_to_task_index = {task: task_index for task_index, task in tasks.items()}
     return tasks, task_to_task_index
 
@@ -243,9 +281,53 @@ def write_episode(episode: dict, local_dir: Path):
     append_jsonlines(episode, local_dir / EPISODES_PATH)
 
 
-def load_episodes(local_dir: Path) -> dict:
-    episodes = load_jsonlines(local_dir / EPISODES_PATH)
-    return {item["episode_index"]: item for item in sorted(episodes, key=lambda x: x["episode_index"])}
+def load_episodes(local_dir: Path, video_keys: list[str] | None = None) -> dict:
+    jsonl_path = local_dir / EPISODES_PATH
+    if jsonl_path.exists():
+        episodes = load_jsonlines(jsonl_path)
+        return {
+            item["episode_index"]: item
+            for item in sorted(episodes, key=lambda x: x["episode_index"])
+        }
+
+    parquet_paths = sorted(local_dir.glob(V3_EPISODES_GLOB))
+    if not parquet_paths:
+        raise FileNotFoundError(
+            f"Neither legacy episode metadata {jsonl_path} nor LeRobot v3 metadata "
+            f"matching {local_dir / V3_EPISODES_GLOB} exists."
+        )
+
+    required_columns = [
+        "episode_index",
+        "tasks",
+        "length",
+        "data/chunk_index",
+        "data/file_index",
+        "dataset_from_index",
+        "dataset_to_index",
+    ]
+    for video_key in video_keys or []:
+        required_columns.extend(
+            [
+                f"videos/{video_key}/chunk_index",
+                f"videos/{video_key}/file_index",
+                f"videos/{video_key}/from_timestamp",
+                f"videos/{video_key}/to_timestamp",
+            ]
+        )
+
+    episodes = []
+    for parquet_path in parquet_paths:
+        schema_names = set(pq.read_schema(parquet_path).names)
+        missing = [name for name in required_columns if name not in schema_names]
+        if missing:
+            raise ValueError(f"Missing columns in {parquet_path}: {missing}")
+        episodes.extend(pq.read_table(parquet_path, columns=required_columns).to_pylist())
+
+    return {
+        int(item["episode_index"]): item
+        for item in sorted(episodes, key=lambda x: x["episode_index"])
+    }
 
 
 def write_episode_stats(episode_index: int, episode_stats: dict, local_dir: Path):
