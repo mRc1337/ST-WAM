@@ -1,0 +1,58 @@
+# DINO target-correspondence evidence sample collected with simulator GT masks.
+# The NPZ sidecars are produced by eval_libero_worker.py with
+# analysis.record_gt_masks=true; masks are evaluation-only and are never passed
+# to the policy.
+
+repo_root: .
+
+model:
+  source_model_config: configs/model/fastwam_wan5b_dino_s_aux_mot.yaml
+  source_task_config: configs/task/libero_wan5b_dino_s_aux_mot_2cam_224_1e-4.yaml
+  model_name: dinov3-vits16-timm
+  model_path: checkpoints/dinov3_weights/dinov3_vits16_timm_lvd1689m.safetensors
+  input_resolution: [224, 448]
+  high_resolution: [448, 896]
+  patch_size: 16
+  feature_dim: 384
+  use_cls_token: false
+  normalize_features: false
+  latent_spatial_pool: [1, 1]
+  encode_microbatch_size: 16
+  feature_layer: x_norm_patchtokens
+
+input:
+  path: evaluate_results/dino_target_similarity/plus_gt_mask_collection/*/rollouts/*.npz
+  video_layout: raw
+  camera_names: [front, wrist]
+  max_episodes: null
+  include_success: true
+  include_failure: true
+  metadata_path: null
+  annotation_path: null
+
+analysis:
+  run_name: plus_gt_mask_collection
+  output_dir: outputs/dino_target_similarity
+  reference_mode: episode_reference
+  view_mode: current_concat
+  resolution_mode: native
+  device: cpu
+  dtype: auto
+  feature_cache_dtype: float16
+  similarity_temperature: 0.07
+  # The cream-cheese target in task 2003 is only a few source pixels wide;
+  # retain it as a one-patch reference instead of dropping the episode.
+  min_patch_overlap: 0.1
+  min_target_patches: 1
+  random_prototypes: 1
+  random_seed: 17
+  progress_points: 25
+  bootstrap_samples: 1000
+  anomaly_success_percentile: 5.0
+  anomaly_persistence_frames: 2
+  gripper_close_threshold: 0.5
+  gripper_close_direction: high
+  save_heatmaps: true
+  save_video: false
+  heatmap_vmin: 0.5
+  heatmap_vmax: 1.0

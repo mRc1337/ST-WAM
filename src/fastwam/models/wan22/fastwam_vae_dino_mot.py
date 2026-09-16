@@ -23,6 +23,7 @@ from .dino_intent import DINOHistoryIntentResampler
 from .dino_video_dit import DinoVideoDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
+from .mot_attention_visualization import MotAttentionRecorder
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .semantic_history import QwenDINOHistoryActionAdapter
 
@@ -183,6 +184,12 @@ class FastWAMVAEDinoMoT(nn.Module):
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_dino = float(loss_lambda_dino)
         self.loss_lambda_action = float(loss_lambda_action)
+
+        # These counters are process-local diagnostic bookkeeping only.  They
+        # do not participate in model state, checkpoint serialization, or the
+        # action generation path.
+        self._mot_attention_call_count = 0
+        self._mot_attention_save_count = 0
 
         self.to(self.device)
 
@@ -1196,6 +1203,50 @@ class FastWAMVAEDinoMoT(nn.Module):
         mask[action_start:, dino_start : dino_start + dino_f0] = True
         return mask
 
+    @staticmethod
+    def _build_attention_key_spans(
+        *,
+        vae_seq_len: int,
+        dino_seq_len: int,
+        action_seq_len: int,
+        vae_tokens_per_frame: int,
+        dino_tokens_per_frame: int,
+        expert_order: Optional[Sequence[str]] = None,
+    ) -> dict[str, tuple[int, int]]:
+        """Describe the exact concatenated MoT key sequence for diagnostics.
+
+        The current tribranch mask/cache implementation has one validated
+        expert order.  Read it from the live MoT object at each call and fail
+        loudly if the architecture ever changes, instead of silently mapping
+        a DINO span onto VAE keys (or vice versa).
+        """
+
+        expected_order = ("video", "dino", "action")
+        actual_order = tuple(str(name) for name in (expert_order or expected_order))
+        if actual_order != expected_order:
+            raise ValueError(
+                "FastWAMVAEDinoMoT attention visualization requires the validated "
+                f"MoT expert order {expected_order}, got {actual_order}."
+            )
+
+        vae_seq_len = int(vae_seq_len)
+        dino_seq_len = int(dino_seq_len)
+        action_seq_len = int(action_seq_len)
+        vae_current = min(int(vae_tokens_per_frame), vae_seq_len)
+        dino_current = min(int(dino_tokens_per_frame), dino_seq_len)
+        dino_start = vae_seq_len
+        action_start = vae_seq_len + dino_seq_len
+        spans: dict[str, tuple[int, int]] = {
+            "vae": (0, vae_current),
+            "dino": (dino_start, dino_start + dino_current),
+            "action": (action_start, action_start + action_seq_len),
+        }
+        if vae_current < vae_seq_len:
+            spans["vae_future"] = (vae_current, vae_seq_len)
+        if dino_current < dino_seq_len:
+            spans["dino_future"] = (dino_start + dino_current, action_start)
+        return spans
+
     def _compute_vae_video_loss_per_sample(
         self,
         pred_video: torch.Tensor,
@@ -1422,6 +1473,9 @@ class FastWAMVAEDinoMoT(nn.Module):
         context_dino_mask: Optional[torch.Tensor] = None,
         context_action: Optional[torch.Tensor] = None,
         context_action_mask: Optional[torch.Tensor] = None,
+        attention_capture: Optional[MotAttentionRecorder] = None,
+        attention_step_idx: Optional[int] = None,
+        attention_timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if context_video is None:
             context_video = context
@@ -1465,6 +1519,21 @@ class FastWAMVAEDinoMoT(nn.Module):
             dino_tokens_per_frame=int(dino_pre["meta"]["tokens_per_frame"]),
             device=vae_pre["tokens"].device,
         )
+        attention_key_spans = None
+        attention_visual_meta = None
+        if attention_capture is not None and attention_capture.active:
+            attention_key_spans = self._build_attention_key_spans(
+                vae_seq_len=int(vae_pre["tokens"].shape[1]),
+                dino_seq_len=int(dino_pre["tokens"].shape[1]),
+                action_seq_len=int(action_pre["tokens"].shape[1]),
+                vae_tokens_per_frame=int(vae_pre["meta"]["tokens_per_frame"]),
+                dino_tokens_per_frame=int(dino_pre["meta"]["tokens_per_frame"]),
+                expert_order=self.mot.expert_order,
+            )
+            attention_visual_meta = {
+                "vae": vae_pre["meta"],
+                "dino": dino_pre["meta"],
+            }
         tokens_out = self.mot(
             embeds_all={
                 "video": vae_pre["tokens"],
@@ -1487,6 +1556,11 @@ class FastWAMVAEDinoMoT(nn.Module):
                 "dino": dino_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            attention_capture=attention_capture,
+            attention_step_idx=attention_step_idx,
+            attention_timestep=attention_timestep,
+            attention_key_spans=attention_key_spans,
+            attention_visual_meta=attention_visual_meta,
         )
         return self.action_expert.post_dit(tokens_out["action"], action_pre)
 
@@ -1501,7 +1575,7 @@ class FastWAMVAEDinoMoT(nn.Module):
         context_dino: torch.Tensor,
         context_dino_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
-    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, int]:
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, int, dict[str, dict[str, Any]]]:
         timestep_video = torch.zeros(
             (first_frame_vae_latents.shape[0],),
             dtype=first_frame_vae_latents.dtype,
@@ -1544,7 +1618,10 @@ class FastWAMVAEDinoMoT(nn.Module):
             },
             static_attention_mask=attention_mask[:static_seq_len, :static_seq_len],
         )
-        return static_kv_cache, attention_mask, static_seq_len
+        return static_kv_cache, attention_mask, static_seq_len, {
+            "vae": vae_pre["meta"],
+            "dino": dino_pre["meta"],
+        }
 
     @torch.no_grad()
     def _predict_action_noise_with_static_cache(
@@ -1556,6 +1633,10 @@ class FastWAMVAEDinoMoT(nn.Module):
         static_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         static_seq_len: int,
+        attention_visual_meta: Optional[dict[str, dict[str, Any]]] = None,
+        attention_capture: Optional[MotAttentionRecorder] = None,
+        attention_step_idx: Optional[int] = None,
+        attention_timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -1563,6 +1644,28 @@ class FastWAMVAEDinoMoT(nn.Module):
             context=context_action,
             context_mask=context_action_mask,
         )
+        attention_key_spans = None
+        if attention_capture is not None and attention_capture.active:
+            if attention_visual_meta is None:
+                attention_visual_meta = {}
+            vae_tokens_per_frame = int(
+                attention_visual_meta.get("vae", {}).get("tokens_per_frame", 0)
+            )
+            dino_tokens_per_frame = int(
+                attention_visual_meta.get("dino", {}).get("tokens_per_frame", 0)
+            )
+            if vae_tokens_per_frame <= 0 or dino_tokens_per_frame <= 0:
+                raise ValueError(
+                    "Static-cache attention visualization requires VAE and DINO grid metadata."
+                )
+            attention_key_spans = self._build_attention_key_spans(
+                vae_seq_len=vae_tokens_per_frame,
+                dino_seq_len=dino_tokens_per_frame,
+                action_seq_len=int(action_pre["tokens"].shape[1]),
+                vae_tokens_per_frame=vae_tokens_per_frame,
+                dino_tokens_per_frame=dino_tokens_per_frame,
+                expert_order=self.mot.expert_order,
+            )
         action_tokens = self.mot.forward_action_with_static_cache(
             action_tokens=action_pre["tokens"],
             action_freqs=action_pre["freqs"],
@@ -1574,6 +1677,11 @@ class FastWAMVAEDinoMoT(nn.Module):
             static_kv_cache=static_kv_cache,
             attention_mask=attention_mask,
             static_seq_len=static_seq_len,
+            attention_capture=attention_capture,
+            attention_step_idx=attention_step_idx,
+            attention_timestep=attention_timestep,
+            attention_key_spans=attention_key_spans,
+            attention_visual_meta=attention_visual_meta,
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
 
@@ -1599,8 +1707,20 @@ class FastWAMVAEDinoMoT(nn.Module):
         semantic_image: Optional[torch.Tensor] = None,
         semantic_prompt: Optional[str] = None,
         use_static_kv_cache: bool = True,
+        mot_attention_visualization: Optional[dict[str, Any]] = None,
+        mot_attention_original_images: Optional[dict[str, Any]] = None,
+        mot_attention_metadata: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         self.eval()
+        attention_call_index = int(self._mot_attention_call_count)
+        self._mot_attention_call_count += 1
+        attention_capture = MotAttentionRecorder(
+            mot_attention_visualization,
+            call_index=attention_call_index,
+            num_layers=int(self.mot.num_layers),
+            num_heads=int(self.mot.num_heads),
+            already_saved=int(self._mot_attention_save_count),
+        )
         if self.intent_encoder is None and self.semantic_history_encoder is None and (
             history_dino_latents is not None
             or history_vae_latents is not None
@@ -1805,8 +1925,14 @@ class FastWAMVAEDinoMoT(nn.Module):
         static_kv_cache = None
         static_attention_mask = None
         static_seq_len = None
+        static_attention_visual_meta = None
         if use_static_kv_cache:
-            static_kv_cache, static_attention_mask, static_seq_len = self._prefill_action_static_cache(
+            (
+                static_kv_cache,
+                static_attention_mask,
+                static_seq_len,
+                static_attention_visual_meta,
+            ) = self._prefill_action_static_cache(
                 first_frame_vae_latents=first_frame_vae_latents,
                 first_frame_dino_latents=first_frame_dino_latents,
                 latents_action=latents_action,
@@ -1823,7 +1949,10 @@ class FastWAMVAEDinoMoT(nn.Module):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+        attention_capture.configure_steps(len(infer_timesteps_action))
+        for step_idx, (step_t_action, step_delta_action) in enumerate(
+            zip(infer_timesteps_action, infer_deltas_action)
+        ):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
             if use_static_kv_cache:
                 pred_action = self._predict_action_noise_with_static_cache(
@@ -1834,6 +1963,10 @@ class FastWAMVAEDinoMoT(nn.Module):
                     static_kv_cache=static_kv_cache,
                     attention_mask=static_attention_mask,
                     static_seq_len=static_seq_len,
+                    attention_visual_meta=static_attention_visual_meta,
+                    attention_capture=attention_capture,
+                    attention_step_idx=step_idx,
+                    attention_timestep=timestep_action,
                 )
             else:
                 pred_action = self._predict_action_noise(
@@ -1850,10 +1983,31 @@ class FastWAMVAEDinoMoT(nn.Module):
                     context_dino_mask=context_dino_mask,
                     context_action=context_action,
                     context_action_mask=context_action_mask,
+                    attention_capture=attention_capture,
+                    attention_step_idx=step_idx,
+                    attention_timestep=timestep_action,
                 )
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
-        return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
+        visualization_path = attention_capture.save(
+            input_image=input_image,
+            original_images=mot_attention_original_images,
+            metadata={
+                "model_identifier": self.__class__.__name__,
+                "mot_expert_order": list(self.mot.expert_order),
+                **dict(mot_attention_metadata or {}),
+            },
+        )
+        if visualization_path is not None:
+            self._mot_attention_save_count += 1
+
+        result = {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
+        if visualization_path is not None:
+            if isinstance(visualization_path, list):
+                result["mot_attention_visualization"] = [str(path) for path in visualization_path]
+            else:
+                result["mot_attention_visualization"] = str(visualization_path)
+        return result
 
     @staticmethod
     def _clone_checkpoint_value_to_cpu(value):

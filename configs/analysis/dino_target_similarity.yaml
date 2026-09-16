@@ -1,0 +1,60 @@
+# Frozen representation diagnosis. This config uses the DINO encoder settings
+# resolved by configs/task/libero_wan5b_dino_s_aux_mot_2cam_224_1e-4.yaml.
+
+repo_root: .
+
+model:
+  source_model_config: configs/model/fastwam_wan5b_dino_s_aux_mot.yaml
+  source_task_config: configs/task/libero_wan5b_dino_s_aux_mot_2cam_224_1e-4.yaml
+  model_name: dinov3-vits16-timm
+  model_path: checkpoints/dinov3_weights/dinov3_vits16_timm_lvd1689m.safetensors
+  input_resolution: [224, 448]
+  high_resolution: [448, 896]
+  patch_size: 16
+  feature_dim: 384
+  use_cls_token: false
+  normalize_features: false
+  latent_spatial_pool: [1, 1]
+  encode_microbatch_size: 16
+  feature_layer: x_norm_patchtokens
+
+input:
+  # Existing evaluator MP4s contain raw RGB views concatenated horizontally.
+  # Replace this path with an optional raw .npz rollout record when available.
+  path: evaluate_results/three_task/step1500_seed42/dual/clean/libero_object/videos/*.mp4
+  video_layout: side_by_side
+  camera_names: [front, wrist]
+  episode_ids: [task9_trial45, task9_trial46]
+  max_episodes: 2
+  include_success: true
+  include_failure: true
+  metadata_path: null
+  annotation_path: annotations/dino_target_similarity/libero_object_pilot.json
+
+analysis:
+  run_name: pilot
+  output_dir: outputs/dino_target_similarity
+  reference_mode: episode_reference
+  view_mode: current_concat
+  resolution_mode: native
+  device: auto
+  dtype: auto
+  feature_cache_dtype: float16
+  similarity_temperature: 0.07
+  min_patch_overlap: 0.5
+  min_target_patches: 2
+  random_prototypes: 1
+  random_seed: 17
+  progress_points: 100
+  bootstrap_samples: 1000
+  anomaly_success_percentile: 5.0
+  anomaly_persistence_frames: 2
+  gripper_close_threshold: 0.5
+  gripper_close_direction: high
+  save_heatmaps: true
+  heatmap_episode_ids: [task9_trial45, task9_trial46]
+  # Visualization-only fixed range; raw metrics always remain cosine values.
+  heatmap_vmin: 0.5
+  heatmap_vmax: 1.0
+  save_video: false
+  video_fps: 12

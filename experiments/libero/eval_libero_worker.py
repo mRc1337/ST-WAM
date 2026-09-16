@@ -31,6 +31,7 @@ from experiments.libero.eval_libero_single import (  # noqa: E402
     _mixed_precision_to_model_dtype,
     _resolve_dataset_stats_path,
     _resolve_eval_device,
+    _validate_expected_task_description,
     _validate_visualize_future_video_cfg,
     run_single_task,
 )
@@ -99,6 +100,13 @@ def eval_worker_process(cfg: DictConfig) -> None:
     processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
     logging.info("Using dataset stats: %s", dataset_stats_path)
+    logging.info(
+        "Evaluation data convention: gripper_action_mode=%s, "
+        "rotate_observation_images_180=%s, env_resolution=%s",
+        cfg.EVALUATION.get("gripper_action_mode", "legacy_rlds"),
+        cfg.EVALUATION.get("rotate_observation_images_180", True),
+        cfg.EVALUATION.get("env_resolution", 256),
+    )
 
     action_horizon_cfg = cfg.EVALUATION.get("action_horizon", None)
     if action_horizon_cfg is None:
@@ -154,6 +162,7 @@ def eval_worker_process(cfg: DictConfig) -> None:
                 suites[suite_name] = benchmark_dict[suite_name]()
             task_suite = suites[suite_name]
             task = task_suite.get_task(task_id)
+            _validate_expected_task_description(task, cfg)
             initial_states = _ensure_initial_states(task_suite.get_task_init_states(task_id), num_trials)
 
             results = {

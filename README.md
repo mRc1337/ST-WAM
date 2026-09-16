@@ -145,6 +145,39 @@ worker, skips completed tasks on resume, supports worker restarts, and accepts a
 CUDA-to-EGL device map for headless rendering. Run it with `--help` for all
 options.
 
+For the optional same-call MoT action-to-current-VAE/DINO attention maps, see
+[`docs/MOT_ATTENTION_VISUALIZATION.md`](docs/MOT_ATTENTION_VISUALIZATION.md).
+
+For the reproducible three-task DINO/VAE/DINO+VAE ablation on LIBERO-PRO and
+the 745 matching LIBERO-Plus cases, run:
+
+```bash
+./scripts/eval_three_task_ablation.sh \
+  --variants dino_only,vae_only,dino+vae
+```
+
+Use `--plus-only` to evaluate only LIBERO-Plus, `--clean-only` for the three
+clean tasks, and `--force` to rerun completed cases. The script resumes missing
+cases, shards Plus tasks across `--gpu-ids 0,1,2,3`, and writes the comparison
+to `evaluate_results/three_task/step1500_seed42/comparison.md`.
+
+To evaluate the same three training tasks under all five LIBERO-PRO
+perturbations (`env`, `swap`, `object`, `language`, and `task`), run:
+
+```bash
+./scripts/eval_three_task_ablation.sh \
+  --variants dino_only,vae_only,dino+vae \
+  --pro-only
+```
+
+This evaluates only task ids `3, 1, 9` (BBQ sauce, cream cheese, and orange
+juice) in each PRO suite. It uses 50 rollouts per task by default, caches the
+generated environment BDDL/init states under the result directory, resumes
+partial runs, and reports per-perturbation and total PRO success rates in
+`comparison.md` and each variant's `pro_summary.json`. Use
+`--pro-trials N`, `--pro-gpu-id N`, or `--pro-perturbations env,swap,...` to
+adjust the PRO evaluation.
+
 RoboTwin replans every 24 steps. The manager evaluates every task by default;
 set either one task or a validated task list:
 

@@ -1,0 +1,49 @@
+# Reproducible one-episode validation using the simulator-mask recorder.
+# This is a smoke/evidence-path run, not the success/failure study sample.
+repo_root: .
+
+model:
+  model_name: dinov3-vits16-timm
+  model_path: checkpoints/dinov3_weights/dinov3_vits16_timm_lvd1689m.safetensors
+  input_resolution: [224, 448]
+  high_resolution: [448, 896]
+  patch_size: 16
+  feature_dim: 384
+  use_cls_token: false
+  normalize_features: false
+  latent_spatial_pool: [1, 1]
+  encode_microbatch_size: 16
+  feature_layer: x_norm_patchtokens
+
+input:
+  path: evaluate_results/dino_target_similarity/gt_mask_smoke_clean_target/rollouts
+  video_layout: side_by_side
+  camera_names: [front, wrist]
+  max_episodes: 1
+  include_success: true
+  include_failure: true
+  metadata_path: null
+  annotation_path: null
+
+analysis:
+  run_name: gt_mask_smoke_clean_target
+  output_dir: outputs/dino_target_similarity
+  reference_mode: episode_reference
+  view_mode: current_concat
+  resolution_mode: native
+  device: cpu
+  dtype: auto
+  feature_cache_dtype: float16
+  similarity_temperature: 0.07
+  min_patch_overlap: 0.5
+  min_target_patches: 2
+  random_prototypes: 1
+  random_seed: 17
+  progress_points: 25
+  bootstrap_samples: 0
+  anomaly_success_percentile: 5.0
+  anomaly_persistence_frames: 2
+  save_heatmaps: true
+  save_video: false
+  heatmap_vmin: 0.5
+  heatmap_vmax: 1.0

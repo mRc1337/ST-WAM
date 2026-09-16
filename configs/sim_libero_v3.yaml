@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - sim_libero
+  - _self_
+
+# Evaluation convention for the local LeRobot v3 LIBERO conversion. Its RGB
+# streams preserve the simulator orientation and its gripper action already
+# uses the native LIBERO convention (-1=open, +1=close).
+EVALUATION:
+  gripper_action_mode: libero_raw
+  rotate_observation_images_180: false
+  env_resolution: 128

@@ -1,0 +1,30 @@
+{
+  "episodes": [
+    {
+      "episode_id": "task9_trial45",
+      "task_id": "9",
+      "target_name": "orange juice",
+      "reference_frame": 0,
+      "cameras": {
+        "front": {
+          "reference_frame": 0,
+          "bbox": [43, 32, 58, 68]
+        }
+      },
+      "annotation_note": "Manual pilot bbox in the 128x128 front view of the existing dual clean evaluator MP4. The wrist view is intentionally left unannotated until a view-specific target label is available."
+    },
+    {
+      "episode_id": "task9_trial46",
+      "task_id": "9",
+      "target_name": "orange juice",
+      "reference_frame": 0,
+      "cameras": {
+        "front": {
+          "reference_frame": 0,
+          "bbox": [43, 32, 58, 68]
+        }
+      },
+      "annotation_note": "Manual pilot bbox in the 128x128 front view of the existing dual clean evaluator MP4. The wrist view is intentionally left unannotated until a view-specific target label is available."
+    }
+  ]
+}

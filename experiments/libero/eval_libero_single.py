@@ -183,6 +183,10 @@ def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarra
     return np.asarray(cropped, dtype=np.uint8)
 
 
+def _rotate_observation_images_180(cfg: DictConfig) -> bool:
+    return bool(cfg.EVALUATION.get("rotate_observation_images_180", True))
+
+
 def _normalize_proprio(
     proprio: np.ndarray,
     processor: FastWAMProcessor,
@@ -209,7 +213,10 @@ def _obs_to_model_image(
     device: str,
     dtype: torch.dtype,
 ):
-    imgs = get_libero_image(obs)
+    imgs = get_libero_image(
+        obs,
+        rotate_180=_rotate_observation_images_180(cfg),
+    )
     image_meta = processor.shape_meta["images"]
     if len(image_meta) < int(processor.num_output_cameras):
         raise ValueError(
@@ -315,6 +322,222 @@ def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np
     return denorm.numpy()
 
 
+def _postprocess_gripper_action(action: np.ndarray, cfg: DictConfig) -> np.ndarray:
+    """Convert the dataset gripper convention to LIBERO simulator actions."""
+    mode = str(cfg.EVALUATION.get("gripper_action_mode", "legacy_rlds")).strip().lower()
+    if mode == "legacy_rlds":
+        # Legacy Fast-WAM data stores gripper openness in [0, 1]. Convert it
+        # to the LIBERO convention: -1=open and +1=close.
+        action[..., -1] = action[..., -1] * 2 - 1
+        action = invert_gripper_action(action)
+    elif mode == "libero_raw":
+        # LeRobot v3 LIBERO keeps source.action_raw unchanged, including the
+        # native -1=open and +1=close gripper command.
+        pass
+    else:
+        raise ValueError(
+            f"Unsupported EVALUATION.gripper_action_mode={mode!r}. "
+            "Expected one of: ['legacy_rlds', 'libero_raw']."
+        )
+
+    if bool(cfg.EVALUATION.get("binarize_gripper", False)):
+        action[..., -1] = np.sign(action[..., -1])
+    return action
+
+
+def _analysis_rollout_enabled(cfg: DictConfig) -> bool:
+    analysis_cfg = cfg.get("analysis", {})
+    # Recording simulator masks necessarily requires the raw rollout record.
+    return bool(
+        analysis_cfg.get("record_rollout", False)
+        or analysis_cfg.get("record_gt_masks", False)
+    )
+
+
+def _analysis_gt_masks_enabled(cfg: DictConfig) -> bool:
+    return bool(cfg.get("analysis", {}).get("record_gt_masks", False))
+
+
+def _rotate_analysis_mask(mask: np.ndarray, cfg: DictConfig) -> np.ndarray:
+    """Apply the same camera-orientation transform as the RGB recorder."""
+
+    mask = np.asarray(mask).astype(bool)
+    if _rotate_observation_images_180(cfg):
+        mask = mask[::-1, ::-1]
+    return np.ascontiguousarray(mask)
+
+
+def _analysis_target_instances(env: Any, cfg: DictConfig) -> list[str]:
+    """Resolve the manipulated object(s) to keep in simulator GT masks.
+
+    LIBERO's ``get_segmentation_of_interest`` intentionally combines every
+    BDDL ``obj_of_interest`` instance, which commonly includes both the
+    manipulated object and its receptacle.  Target correspondence should not
+    silently treat the receptacle as target, so selection is explicit.
+    """
+
+    analysis_cfg = cfg.get("analysis", {})
+    configured = analysis_cfg.get("target_instances")
+    if configured is None:
+        by_task = analysis_cfg.get("target_instances_by_task")
+        task_id = cfg.get("EVALUATION", {}).get("task_id")
+        if by_task is not None and task_id is not None:
+            configured = by_task.get(str(task_id), by_task.get(int(task_id)))
+    if configured is None:
+        available = [str(item) for item in getattr(env, "obj_of_interest", [])]
+        raise RuntimeError(
+            "analysis.record_gt_masks=true requires analysis.target_instances "
+            "(or target_instances_by_task) because LIBERO obj_of_interest may "
+            f"include a receptacle. Available instances: {available}"
+        )
+    if isinstance(configured, str):
+        configured = [configured]
+    target_instances = [str(item) for item in configured]
+    if not target_instances:
+        raise ValueError("analysis.target_instances must contain at least one instance name")
+    available = {str(item) for item in getattr(env, "obj_of_interest", [])}
+    missing = [item for item in target_instances if item not in available]
+    if missing:
+        raise ValueError(
+            f"analysis.target_instances={target_instances} contains unknown instance(s) {missing}; "
+            f"available obj_of_interest={sorted(available)}"
+        )
+    instance_to_id = {str(key): int(value) for key, value in getattr(env, "instance_to_id", {}).items()}
+    missing_ids = [item for item in target_instances if item not in instance_to_id]
+    if missing_ids:
+        raise RuntimeError(
+            f"LIBERO segmentation mapping has no ID for target instance(s) {missing_ids}; "
+            f"mapping keys={sorted(instance_to_id)}"
+        )
+    return target_instances
+
+
+def _extract_analysis_gt_masks(
+    obs: dict[str, Any],
+    env: Any,
+    cfg: DictConfig,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Extract target-only simulator masks for the two LIBERO cameras.
+
+    LIBERO's ``SegmentationRenderEnv`` can combine all BDDL
+    ``obj_of_interest`` instances, including a destination receptacle.  We
+    instead select the explicitly configured manipulated instance IDs, so
+    background / robot / receptacle pixels cannot be mistaken for the target.
+    Missing segmentation is an error when explicitly requested; silently
+    writing an incomplete GT trajectory would invalidate the study.
+    """
+
+    if not hasattr(env, "instance_to_id"):
+        raise RuntimeError(
+            "analysis.record_gt_masks=true requires LIBERO SegmentationRenderEnv; "
+            "the active environment does not expose instance_to_id segmentation mapping."
+        )
+
+    target_instances = _analysis_target_instances(env, cfg)
+    instance_to_id = {str(key): int(value) for key, value in getattr(env, "instance_to_id", {}).items()}
+    segmentation_keys = {
+        "front": "agentview_segmentation_instance",
+        "wrist": "robot0_eye_in_hand_segmentation_instance",
+    }
+    masks: list[np.ndarray] = []
+    for camera, key in segmentation_keys.items():
+        if key not in obs:
+            raise RuntimeError(
+                f"analysis.record_gt_masks=true but observation key {key!r} is missing. "
+                f"Available keys include: {sorted(str(item) for item in obs if 'segmentation' in str(item))}"
+            )
+        segmentation = np.asarray(obs[key])
+        if segmentation.ndim == 3 and segmentation.shape[-1] == 1:
+            segmentation = segmentation[..., 0]
+        if segmentation.ndim != 2:
+            raise ValueError(
+                f"Expected {key} to have shape [H,W] or [H,W,1], got {segmentation.shape}"
+            )
+        target_mask = np.zeros(segmentation.shape, dtype=bool)
+        for instance_name in target_instances:
+            target_mask |= segmentation == instance_to_id[instance_name]
+        target_mask = _rotate_analysis_mask(target_mask, cfg)
+        if not bool(target_mask.any()):
+            logging.warning("Simulator target mask is empty for camera=%s at the current frame.", camera)
+        masks.append(target_mask)
+
+    metadata = {
+        "source": "libero.SegmentationRenderEnv.instance_to_id",
+        "camera_names": ["front", "wrist"],
+        "target_instances": target_instances,
+        "target_instance_selection": "analysis.target_instances",
+        "available_obj_of_interest": [str(item) for item in getattr(env, "obj_of_interest", [])],
+        "segmentation_id_mapping": {
+            str(key): str(value)
+            for key, value in getattr(env, "segmentation_id_mapping", {}).items()
+        },
+        "orientation_transform": "rotate_180" if _rotate_observation_images_180(cfg) else "none",
+    }
+    return np.stack(masks, axis=0).astype(np.uint8), metadata
+
+
+def _analysis_rollout_dir(cfg: DictConfig, fallback: Path) -> Path:
+    analysis_cfg = cfg.get("analysis", {})
+    configured = analysis_cfg.get("rollout_dir", None)
+    return Path(configured) if configured is not None else fallback / "analysis_rollouts"
+
+
+def _save_analysis_rollout(
+    output_dir: Path,
+    *,
+    task_id: int,
+    episode_idx: int,
+    task_description: str,
+    success: bool,
+    rollout: dict[str, Any],
+) -> Path:
+    """Persist optional raw RGB/state/action data for offline analysis.
+
+    This is deliberately opt-in and does not alter action inference.  Frames
+    are saved without the text labels used by the legacy replay-video writer.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_task = "_".join(str(task_description).lower().split())[:80]
+    path = output_dir / f"task{int(task_id)}_trial{int(episode_idx)}--success={bool(success)}--task={safe_task}.npz"
+    frames = np.stack(
+        [np.stack(rollout["image"], axis=0), np.stack(rollout["wrist_image"], axis=0)],
+        axis=1,
+    )
+    metadata = {
+        "task_id": int(task_id),
+        "episode_id": f"task{int(task_id)}_trial{int(episode_idx)}",
+        "task_name": str(task_description),
+        "success": bool(success),
+        "failure_reason": "not_applicable" if success else "unknown",
+        "failure_class": "success" if success else "unknown",
+        "grasp_relevant_failure": "not_applicable" if success else "unknown",
+        "camera_names": ["front", "wrist"],
+        "source": "experiments/libero/eval_libero_single.py",
+        "failure_frame": int(max(len(rollout["timestamps"]) - 1, 0)),
+        "failure_frame_source": "terminal_proxy",
+    }
+    payload: dict[str, Any] = {
+        "frames": frames,
+        "actions": np.asarray(rollout["actions"], dtype=np.float32),
+        "states": np.asarray(rollout["states"], dtype=np.float32),
+        "timestamps": np.asarray(rollout["timestamps"], dtype=np.int64),
+        "gripper_state": np.asarray(rollout["states"], dtype=np.float32)[:, -1],
+    }
+    if rollout.get("gt_masks"):
+        gt_masks = np.stack(rollout["gt_masks"], axis=0).astype(np.uint8)
+        if gt_masks.ndim != 4 or gt_masks.shape[1] != 2:
+            raise ValueError(f"Expected recorded gt_masks [T,2,H,W], got {gt_masks.shape}")
+        payload["gt_masks"] = gt_masks
+        metadata["gt_mask_source"] = rollout.get("gt_mask_metadata", {}).get(
+            "source", "libero.SegmentationRenderEnv"
+        )
+        metadata["gt_mask_metadata"] = rollout.get("gt_mask_metadata", {})
+    payload["metadata_json"] = np.asarray(json.dumps(metadata), dtype=np.str_)
+    np.savez_compressed(path, **payload)
+    return path
+
+
 def _get_num_video_frames(cfg: DictConfig) -> int:
     return (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
 
@@ -328,6 +551,20 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
         raise ValueError(
             "EVALUATION.visualize_future_video=true requires "
             "model.video_dit_config.action_conditioned=false."
+        )
+
+
+def _validate_expected_task_description(task: Any, cfg: DictConfig) -> None:
+    expected = cfg.EVALUATION.get("expected_task_description", None)
+    if expected is None:
+        return
+    expected = " ".join(str(expected).strip().lower().split())
+    actual = " ".join(str(task.language).strip().lower().split())
+    if actual != expected:
+        raise ValueError(
+            "Resolved LIBERO task does not match EVALUATION.expected_task_description: "
+            f"suite={cfg.EVALUATION.task_suite_name!r}, task_id={cfg.EVALUATION.task_id}, "
+            f"expected={expected!r}, actual={actual!r}. Check LIBERO_ROOT/PYTHONPATH."
         )
 
 
@@ -441,6 +678,8 @@ def _predict_action_chunk(
     input_h: int,
     model_device: str,
     history_video: Optional[torch.Tensor] = None,
+    episode_idx: Optional[int] = None,
+    environment_step: Optional[int] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -479,6 +718,52 @@ def _predict_action_chunk(
     }
     if history_video is not None:
         infer_kwargs["history_video"] = history_video
+    mot_attention_cfg = cfg.EVALUATION.get("mot_attention_visualization", None)
+    if mot_attention_cfg is not None and bool(mot_attention_cfg.get("enabled", False)):
+        mot_attention_cfg = OmegaConf.to_container(mot_attention_cfg, resolve=True)
+        if not isinstance(mot_attention_cfg, dict):
+            raise ValueError("EVALUATION.mot_attention_visualization must resolve to a mapping")
+        image_meta = list(processor.shape_meta.get("images", []))
+        camera_names = [str(meta["key"]) for meta in image_meta[: int(processor.num_output_cameras)]]
+        camera_sizes = [
+            [int(meta["shape"][1]), int(meta["shape"][2])]
+            for meta in image_meta[: int(processor.num_output_cameras)]
+        ]
+        configured_camera_layout = mot_attention_cfg.get("camera_layout")
+        if configured_camera_layout is None or str(configured_camera_layout).strip().lower() in {
+            "",
+            "auto",
+        }:
+            configured_camera_layout = cfg.data.train.get("concat_multi_camera", "full")
+        mot_attention_cfg["camera_layout"] = str(configured_camera_layout)
+        if not mot_attention_cfg.get("camera_names"):
+            mot_attention_cfg["camera_names"] = camera_names
+        if not mot_attention_cfg.get("camera_sizes"):
+            mot_attention_cfg["camera_sizes"] = camera_sizes
+        infer_kwargs["mot_attention_visualization"] = mot_attention_cfg
+        infer_kwargs["mot_attention_original_images"] = imgs
+        infer_kwargs["mot_attention_metadata"] = {
+            "config_identifier": str(cfg.model.get("_target_", "unknown")),
+            "checkpoint": str(cfg.ckpt),
+            "checkpoint_sha256": (
+                None
+                if cfg.EVALUATION.get("checkpoint_sha256") is None
+                else str(cfg.EVALUATION.get("checkpoint_sha256"))
+            ),
+            "task_suite": str(cfg.EVALUATION.task_suite_name),
+            "task_id": int(cfg.EVALUATION.task_id),
+            "task_description": str(task_description),
+            "episode_index": None if episode_idx is None else int(episode_idx),
+            "environment_step": (
+                None if environment_step is None else int(environment_step)
+            ),
+            "replan_steps": int(cfg.EVALUATION.get("replan_steps", 5)),
+            "input_size_hw": [int(input_h), int(input_w)],
+            "image_preprocessing_description": (
+                "LIBERO get_libero_image orientation transform, per-camera center-crop/resize, "
+                "configured camera concatenation, then float RGB scaling to [-1, 1]."
+            ),
+        }
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -496,12 +781,7 @@ def _predict_action_chunk(
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
-    # The dataloader flips the sign of the gripper action to align with other datasets
-    # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
-    action[..., -1] = action[..., -1] * 2 - 1
-    action = invert_gripper_action(action)
-    if bool(cfg.EVALUATION.get("binarize_gripper", False)):
-        action[..., -1] = np.sign(action[..., -1])
+    action = _postprocess_gripper_action(action, cfg)
     return action, imgs, predicted_future_frames
 
 
@@ -512,6 +792,13 @@ def _get_max_steps(task_suite_name: str) -> int:
         "libero_goal": 400,
         "libero_10": 700,
         "libero_90": 700,
+        # LIBERO-PRO keeps the LIBERO-Object episode horizon for each of its
+        # five single-perturbation suites.
+        "libero_object_env": 400,
+        "libero_object_swap": 400,
+        "libero_object_object": 400,
+        "libero_object_lan": 400,
+        "libero_object_task": 400,
     }
     if task_suite_name not in suite_steps:
         raise ValueError(f"Unknown task suite: {task_suite_name}")
@@ -531,12 +818,14 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
+) -> tuple[bool, list, list[dict[str, Any]], Optional[float], Optional[dict[str, Any]]]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    record_rollout = _analysis_rollout_enabled(cfg)
+    record_gt_masks = _analysis_gt_masks_enabled(cfg)
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
     env.reset()
@@ -556,6 +845,18 @@ def run_single_episode(
     history_offsets = _get_history_frame_offsets(model) if use_history_intent else []
     max_history_frames = 1 + max([max(0, -int(offset)) for offset in history_offsets], default=0)
     history_frames: list[torch.Tensor] = []
+    analysis_rollout: Optional[dict[str, Any]] = None
+    if record_rollout:
+        analysis_rollout = {
+            "image": [],
+            "wrist_image": [],
+            "actions": [],
+            "states": [],
+            "timestamps": [],
+        }
+        if record_gt_masks:
+            analysis_rollout["gt_masks"] = []
+            analysis_rollout["gt_mask_metadata"] = {}
 
     t = 0
     done = False
@@ -598,6 +899,8 @@ def run_single_episode(
                 input_h=input_h,
                 model_device=model_device,
                 history_video=history_video,
+                episode_idx=episode_idx,
+                environment_step=t,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -616,14 +919,35 @@ def run_single_episode(
                 pending_actions = action_chunk[:replan_steps].tolist()
             replay_images.append(imgs.copy())
         else:
-            imgs = get_libero_image(obs)
+            imgs = get_libero_image(
+                obs,
+                rotate_180=_rotate_observation_images_180(cfg),
+            )
             replay_images.append(imgs.copy())
+
+        if analysis_rollout is not None:
+            # This is the observation immediately before the action that is
+            # actually sent to LIBERO. It is aligned one-to-one with actions.
+            analysis_rollout["image"].append(np.asarray(imgs["image"], dtype=np.uint8).copy())
+            analysis_rollout["wrist_image"].append(np.asarray(imgs["wrist_image"], dtype=np.uint8).copy())
+            analysis_rollout["actions"].append(np.asarray(pending_actions[0], dtype=np.float32).copy())
+            analysis_rollout["states"].append(_extract_sim_state(obs).copy())
+            analysis_rollout["timestamps"].append(np.asarray(t, dtype=np.int64))
+            if record_gt_masks:
+                gt_masks, gt_mask_metadata = _extract_analysis_gt_masks(obs, env, cfg)
+                analysis_rollout["gt_masks"].append(gt_masks)
+                analysis_rollout["gt_mask_metadata"] = gt_mask_metadata
 
         obs, _, done, _ = env.step(pending_actions.pop(0))
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
-                current_predicted_future_clip["gt_frames"].append(get_libero_image(obs))
+                current_predicted_future_clip["gt_frames"].append(
+                    get_libero_image(
+                        obs,
+                        rotate_180=_rotate_observation_images_180(cfg),
+                    )
+                )
             if done or len(pending_actions) == 0:
                 expected_frame_count = 1 + sum(
                     1 for capture_step in capture_steps if capture_step <= current_replan_step
@@ -678,7 +1002,7 @@ def run_single_episode(
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr
+    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, analysis_rollout
 
 
 def run_single_task(
@@ -695,7 +1019,15 @@ def run_single_task(
     input_h: int,
     model_device: str,
 ) -> dict:
-    env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    env_resolution = int(cfg.EVALUATION.get("env_resolution", LIBERO_ENV_RESOLUTION))
+    if env_resolution <= 0:
+        raise ValueError(f"EVALUATION.env_resolution must be positive, got {env_resolution}.")
+    env, task_description = get_libero_env(
+        task,
+        env_resolution,
+        cfg.get("seed"),
+        record_gt_masks=_analysis_gt_masks_enabled(cfg),
+    )
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
@@ -703,12 +1035,15 @@ def run_single_task(
         "success_episodes": [],
         "task_description": task_description,
     }
+    record_rollout = _analysis_rollout_enabled(cfg)
+    if record_rollout:
+        results["analysis_rollout_paths"] = []
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
+        success, replay_images, predicted_future_video_clips, episode_mean_psnr, analysis_rollout = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
@@ -726,6 +1061,16 @@ def run_single_task(
             results["success_episodes"].append(trial_idx)
         else:
             results["failure_episodes"].append(trial_idx)
+        if analysis_rollout is not None:
+            rollout_path = _save_analysis_rollout(
+                _analysis_rollout_dir(cfg, video_dir.parent),
+                task_id=int(cfg.EVALUATION.task_id),
+                episode_idx=trial_idx,
+                task_description=task_description,
+                success=success,
+                rollout=analysis_rollout,
+            )
+            results["analysis_rollout_paths"].append(str(rollout_path))
         if visualize_future_video:
             results["episode_future_video_psnr"].append(episode_mean_psnr)
 
@@ -806,6 +1151,13 @@ def eval_single_process(cfg: DictConfig):
     processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
     logging.info("Using dataset stats: %s", dataset_stats_path)
+    logging.info(
+        "Evaluation data convention: gripper_action_mode=%s, "
+        "rotate_observation_images_180=%s, env_resolution=%s",
+        cfg.EVALUATION.get("gripper_action_mode", "legacy_rlds"),
+        _rotate_observation_images_180(cfg),
+        cfg.EVALUATION.get("env_resolution", LIBERO_ENV_RESOLUTION),
+    )
 
     action_horizon_cfg = cfg.EVALUATION.get("action_horizon", None)
     if action_horizon_cfg is None:
@@ -834,6 +1186,7 @@ def eval_single_process(cfg: DictConfig):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.EVALUATION.task_suite_name]()
     task = task_suite.get_task(cfg.EVALUATION.task_id)
+    _validate_expected_task_description(task, cfg)
     initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
 
     while len(initial_states) < int(cfg.EVALUATION.num_trials):

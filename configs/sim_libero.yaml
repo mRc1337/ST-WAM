@@ -16,6 +16,7 @@ model:
 EVALUATION:
   task_suite_name: libero_spatial
   task_id: 0
+  expected_task_description: null
   num_trials: 50
   output_dir: ./evaluate_results/libero/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
 
@@ -24,6 +25,12 @@ EVALUATION:
   num_steps_wait: 30
   replan_steps: 10
   binarize_gripper: true
+  # Legacy Fast-WAM defaults. LeRobot v3 raw LIBERO evaluation must override
+  # these with gripper_action_mode=libero_raw,
+  # rotate_observation_images_180=false, and env_resolution=128.
+  gripper_action_mode: legacy_rlds
+  rotate_observation_images_180: true
+  env_resolution: 256
   use_action_ensembler: false
   visualize_future_video: false
 
@@ -36,9 +43,50 @@ EVALUATION:
   rand_device: cpu
   tiled: false
 
+  # Optional Figure-5-style MoT cross-branch attention diagnostic.  It is
+  # disabled by default and only applies to FastWAMVAEDinoMoT inference.
+  mot_attention_visualization:
+    enabled: false
+    output_dir: ${EVALUATION.output_dir}/mot_attention
+    layer: last
+    layers: null
+    denoising_step: last
+    denoising_steps: null
+    heads: all
+    action_query_range: all
+    action_query_ranges: null
+    call_indices: all
+    max_saves: 1
+    display_normalization: percentile
+    display_percentiles: [1.0, 99.0]
+    overlay_alpha: 0.45
+    input_range: [-1.0, 1.0]
+    # The LIBERO entry point fills camera_layout from the actual
+    # data.train.concat_multi_camera setting when this is null.
+    camera_layout: null
+    camera_names: null
+    camera_sizes: null
+
   # Optional external inputs
   dataset_stats_path: null
+  # Recorded in every attention metadata.json when the exact checkpoint hash
+  # is supplied by an evaluation runner.  This is bookkeeping only and does
+  # not affect model inference.
+  checkpoint_sha256: null
   device: cuda
+
+# Optional raw rollout recorder for offline representation diagnosis. It is
+# false by default and is completely outside the action-inference path.
+analysis:
+  record_rollout: false
+  # Requires a LIBERO SegmentationRenderEnv and records target-only instance
+  # masks in the optional NPZ rollout sidecar. It is false by default.
+  record_gt_masks: false
+  # Required when record_gt_masks=true. LIBERO obj_of_interest often contains
+  # both the manipulated object and its receptacle; select only the target.
+  target_instances: null
+  target_instances_by_task: null
+  rollout_dir: null
 
 MULTIRUN:
   create_only: false

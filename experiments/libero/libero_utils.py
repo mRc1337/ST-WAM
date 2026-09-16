@@ -2,6 +2,7 @@
 
 import math
 import os
+import re
 import time
 import pathlib
 
@@ -14,12 +15,38 @@ import imageio
 from PIL import Image, ImageDraw
 import numpy as np
 from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv
+from libero.libero.envs import OffScreenRenderEnv, SegmentationRenderEnv, SubprocVectorEnv
 from fastwam.utils.video_io import save_mp4
 
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+
+
+def _read_perturbed_task_language(task, bddl_path: pathlib.Path) -> str:
+    """Return the BDDL language for PRO semantic/task perturbations.
+
+    LIBERO's benchmark task map derives ``task.language`` from the filename.
+    That is correct for the normal suites, but the LIBERO-PRO ``_lan`` and
+    ``_task`` generators replace ``(:language ...)`` while keeping the
+    original filename.  Reading the BDDL block for those suites ensures the
+    OOD instruction is actually sent to the policy.
+    """
+
+    task_suite = str(getattr(task, "problem_folder", ""))
+    if not task_suite.endswith(("_lan", "_task")):
+        return str(task.language)
+
+    try:
+        content = bddl_path.read_text(encoding="utf-8")
+    except OSError:
+        return str(task.language)
+
+    match = re.search(r"\(:language\b\s*(.*?)\)", content, flags=re.DOTALL)
+    if match is None:
+        return str(task.language)
+    language = " ".join(match.group(1).split())
+    return language or str(task.language)
 
 
 def as_uint8_rgb_image(image):
@@ -50,23 +77,33 @@ def as_uint8_rgb_image(image):
     return np.ascontiguousarray(np.clip(image, 0, 255).astype(np.uint8))
 
 
-def get_libero_env(task, resolution, seed, env_num=1):
-    """Initializes and returns the LIBERO environment, along with the task description."""
-    task_description = task.language
+def get_libero_env(task, resolution, seed, env_num=1, record_gt_masks=False):
+    """Initialize LIBERO and optionally expose simulator target segmentation.
+
+    ``record_gt_masks`` is deliberately opt-in.  The normal evaluator still
+    uses :class:`OffScreenRenderEnv`; when enabled, LIBERO's instance
+    segmentation renderer is used and the caller can read the
+    ``*_segmentation_instance`` observations.  The segmentation is an
+    analysis-only side channel and never enters policy inference.
+    """
     task_bddl_file = (
         pathlib.Path(get_libero_path("bddl_files"))
         / task.problem_folder
         / task.bddl_file
     )
+    task_description = _read_perturbed_task_language(task, task_bddl_file)
     env_args = {
         "bddl_file_name": str(task_bddl_file),
         "camera_heights": resolution,
         "camera_widths": resolution,
     }
+    env_class = SegmentationRenderEnv if bool(record_gt_masks) else OffScreenRenderEnv
+    if record_gt_masks:
+        env_args["camera_segmentations"] = "instance"
     if env_num > 1:
-        env = SubprocVectorEnv([lambda: OffScreenRenderEnv(**env_args) for _ in range(env_num)])
+        env = SubprocVectorEnv([lambda: env_class(**env_args) for _ in range(env_num)])
     else:
-        env = OffScreenRenderEnv(**env_args)
+        env = env_class(**env_args)
     env.seed(
         seed
     )  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
@@ -76,14 +113,21 @@ def get_libero_dummy_action():
     """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
 
-def get_libero_image(obs):
-    """Extracts image from observations and preprocesses it."""
-    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-    # IMPORTANT: rotate 180 degrees to match train preprocessing
-    
-    # [yc] wrist image
-    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-    # IMPORTANT: rotate 180 degrees to match train preprocessing
+def get_libero_image(obs, rotate_180=True):
+    """Extract the two LIBERO RGB observations.
+
+    Official Fast-WAM LIBERO data expects the simulator images rotated by 180
+    degrees.  Some LeRobot v3 conversions store the raw simulator orientation,
+    so evaluation must be able to preserve that orientation instead.
+    """
+    img = np.asarray(obs["agentview_image"])
+    wrist_img = np.asarray(obs["robot0_eye_in_hand_image"])
+    if rotate_180:
+        img = img[::-1, ::-1]
+        wrist_img = wrist_img[::-1, ::-1]
+
+    img = np.ascontiguousarray(img)
+    wrist_img = np.ascontiguousarray(wrist_img)
     
     return {
         "image": img,

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
 from .wan_video_dit import flash_attention, modulate, rope_apply
+from .mot_attention_visualization import MotAttentionRecorder
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -95,6 +96,45 @@ class MoT(nn.Module):
                 use_reentrant=False,
             )
         return _forward(q_cat, k_cat, v_cat)
+
+    @staticmethod
+    def _maybe_capture_action_attention(
+        *,
+        attention_capture: Optional[MotAttentionRecorder],
+        q_action: torch.Tensor,
+        k_all: torch.Tensor,
+        attention_mask: torch.Tensor,
+        layer_idx: int,
+        step_idx: Optional[int],
+        timestep,
+        key_spans: Optional[Mapping[str, Sequence[int]]],
+        visual_meta: Optional[Mapping[str, Mapping]],
+        scale: float,
+    ) -> None:
+        """Read action Q/K on a diagnostic side path, without changing SDPA."""
+
+        if attention_capture is None:
+            return
+        if step_idx is None:
+            raise ValueError("An attention visualization capture requires an inference step index.")
+        if not attention_capture.should_capture(layer_idx=layer_idx, step_idx=int(step_idx)):
+            return
+        if key_spans is None or visual_meta is None:
+            raise ValueError(
+                "Attention visualization requires explicit key spans and visual grid metadata; "
+                "the current MoT call did not provide them."
+            )
+        attention_capture.capture(
+            q_action=q_action,
+            k_all=k_all,
+            attention_mask=attention_mask,
+            layer_idx=layer_idx,
+            step_idx=int(step_idx),
+            timestep=timestep,
+            key_spans=key_spans,
+            visual_meta=visual_meta,
+            scale=scale,
+        )
 
     @staticmethod
     def _apply_expert_post_block(
@@ -483,6 +523,11 @@ class MoT(nn.Module):
         static_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         static_seq_len: int,
+        attention_capture: Optional[MotAttentionRecorder] = None,
+        attention_step_idx: Optional[int] = None,
+        attention_timestep=None,
+        attention_key_spans: Optional[Mapping[str, Sequence[int]]] = None,
+        attention_visual_meta: Optional[Mapping[str, Mapping]] = None,
     ) -> torch.Tensor:
         """Run the action branch against a cached multi-expert static prefix."""
         if "action" not in self.mixtures:
@@ -541,11 +586,25 @@ class MoT(nn.Module):
                     f"expected {static_seq_len}."
                 )
 
+            k_all = torch.cat([k_static, k_action], dim=1)
+            v_all = torch.cat([v_static, v_action], dim=1)
             mixed = self._mixed_attention(
                 q_cat=q_action,
-                k_cat=torch.cat([k_static, k_action], dim=1),
-                v_cat=torch.cat([v_static, v_action], dim=1),
+                k_cat=k_all,
+                v_cat=v_all,
                 attention_mask=action_attention_mask,
+            )
+            self._maybe_capture_action_attention(
+                attention_capture=attention_capture,
+                q_action=q_action,
+                k_all=k_all,
+                attention_mask=action_attention_mask,
+                layer_idx=layer_idx,
+                step_idx=attention_step_idx,
+                timestep=attention_timestep,
+                key_spans=attention_key_spans,
+                visual_meta=attention_visual_meta,
+                scale=1.0 / (self.attn_head_dim ** 0.5),
             )
             x = self._apply_post_with_optional_checkpoint(
                 block=block,
@@ -671,6 +730,11 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        attention_capture: Optional[MotAttentionRecorder] = None,
+        attention_step_idx: Optional[int] = None,
+        attention_timestep=None,
+        attention_key_spans: Optional[Mapping[str, Sequence[int]]] = None,
+        attention_visual_meta: Optional[Mapping[str, Mapping]] = None,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -748,6 +812,22 @@ class MoT(nn.Module):
                 )
 
             mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)
+
+            action_index = self.expert_order.index("action")
+            action_start = int(sum(seq_lens[:action_index]))
+            action_end = action_start + int(seq_lens[action_index])
+            self._maybe_capture_action_attention(
+                attention_capture=attention_capture,
+                q_action=q_cat[:, action_start:action_end, :],
+                k_all=k_cat,
+                attention_mask=attention_mask[action_start:action_end, :],
+                layer_idx=layer_idx,
+                step_idx=attention_step_idx,
+                timestep=attention_timestep,
+                key_spans=attention_key_spans,
+                visual_meta=attention_visual_meta,
+                scale=1.0 / (self.attn_head_dim ** 0.5),
+            )
 
             start = 0
             for name, seq_len in zip(self.expert_order, seq_lens):
